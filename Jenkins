@@ -1,0 +1,411 @@
+
+node{
+
+env.NAMEMVC="${JOB_BASE_NAME}"
+env.NAMESPACE="integration"
+env.IMAGENAME="registry.local/msa/${JOB_BASE_NAME}"
+env.IMAGETAG="${BUILD_NUMBER}"
+env.WEB_LOCATION="$WORKSPACE/kubernetes/${JOB_BASE_NAME}"
+env.KUBECONFIG="$WORKSPACE/kubernetes/kubeconfig/staging"
+env.GITURL="https://repo.evampsaanga.com:5000/jazzmsa/balanceshare"
+env.GIT_DIR_NAME="balanceshare"
+
+
+
+stage('Code Checkout'){
+
+cleanWs()
+sh 'git config --global http.sslVerify false'
+sleep (10)
+
+git branch: '${GIT_BRANCH}', credentialsId: 'devops.msa', url: "$GITURL"
+
+sh "git rev-parse --short HEAD > .git/commit-id"
+//IMAGETAG= readFile('.git/commit-id').trim()
+sh 'echo $IMAGETAG'
+echo IMAGETAG
+
+}
+
+
+//######################################################## START INTEGRATION/STAGING #############################################################
+
+if ((env.ENVIRONMENT == 'STAGING')){
+
+env.MEMORY_LIMIT="1Gi"
+env.CPU_LIMIT="1000m"
+env.MEMORY_RESOURCE="512Mi"
+env.CPU_RESOURCE="500m"
+env.SPRING_PROFILE="stg"
+
+stage('Compile'){
+def javatool = tool name: 'java8', type: 'jdk'
+  withEnv( ["PATH+JAVATOOL=${javatool}/bin"] ) {
+   def maventool = tool name: 'maven', type: 'maven'
+      withEnv( ["PATH+MAVENTOOL=${maventool}/bin"] ) {
+       sh 'mvn clean install -DskipTests'
+      //sh 'mvn clean install'
+
+}
+}
+
+}
+stage('Publish-Junit') {
+    
+ //-   junit healthScaleFactor: 5.0, keepLongStdio: true, testResults: 'target/surefire-reports/*.xml'
+ //  perfReport compareBuildPrevious: true, filterRegex: '', modeEvaluation: true, showTrendGraphs: true, sourceDataFiles: 'target/surefire-reports/*.xml'
+   
+    
+}
+
+
+ stage('Scan-code') {
+
+ withSonarQubeEnv('sonarqube') {
+
+ def sonarqubetool = tool name: 'sonarqube', type: 'hudson.plugins.sonar.SonarRunnerInstallation'
+ withEnv( ["PATH+SONARQUBESCANNER=${sonarqubetool}/bin"] ) {
+
+ sh 'sonar-scanner  ' +
+ '-Dsonar.projectKey=$JOB_BASE_NAME ' +
+ '-Dsonar.projectName=$JOB_BASE_NAME ' +
+ '-Dsonar.projectVersion=1.0 ' +
+ '-Dsonar.sources=$WORKSPACE/src ' +
+ '-Dsonar.binaries=$WORKSPACE/ ' +
+ '-Dsonar.java.binaries=$WORKSPACE/ ' 
+         } 
+     }
+ }
+
+sleep (30)
+
+ stage("Quality gate") {
+      timeout(time: 30, unit: 'SECONDS') {
+              def qg = waitForQualityGate()
+              if (qg.status != 'OK') {
+                  error "Pipeline aborted due to quality gate failure: ${qg.status}"
+              }
+          }
+ }
+
+
+stage('Docker build'){
+
+// This step should not normally be used in your script. Consult the inline help for details.
+withDockerRegistry(credentialsId: 'harbor', url: 'https://registry.local') {
+    // some block
+ //   echo "docker build -t ${IMAGENAME}:${IMAGETAG} ."
+     sh "docker build -t ${IMAGENAME}:${IMAGETAG} ."
+     sh "docker push ${IMAGENAME}:${IMAGETAG}"
+
+    
+}
+
+}
+
+
+stage('Deploy on K8s'){
+
+sh "cp $JENKINS_HOME/custom/kubeconfig/* $WORKSPACE/kubernetes/kubeconfig/"  
+sh "chmod +x $WORKSPACE/kubernetes/deploy.sh"
+sh "$WORKSPACE/kubernetes/deploy.sh"
+
+// sh "ansible-playbook $WORKSPACE/ansible/deploy.yaml  --extra-vars  IMAGENAME=${IMAGENAME} --extra-vars imageTag=${imageTag} -i $WORKSPACE/ansible/inventory.ini"
+
+}
+
+
+stage('Sanity Testcases'){
+    
+ dir("${WORKSPACE}/QA") {
+    
+         
+			sh '$JENKINS_HOME/tools/jmeter/bin/jmeter -n -t Balance_Share.jmx -l report.jtl'
+
+
+       }
+
+}
+
+stage('Publish-test-report'){
+    
+    dir("${WORKSPACE}/QA") {
+    perfReport filterRegex: '', modeOfThreshold: true,relativeFailedThresholdNegative: 1.2, relativeFailedThresholdPositive: 1.89, relativeUnstableThresholdNegative: 1.8, relativeUnstableThresholdPositive: 1.5, showTrendGraphs: true, sourceDataFiles: 'report.jtl'
+    
+    }
+
+}
+
+
+
+
+//--
+stage('Creating-TAG&Release')
+{
+
+timeout(time: 5, unit: 'DAYS')  {
+
+env.JENKINS_GIT_TAG = input message: 'CREATING TAG: Press OK incase creating tag for production env..', parameters: [choice(choices: ['No', 'Yes'], description: 'Select Yes or No', name: '')]
+          
+}
+
+
+
+if ((env.JENKINS_GIT_TAG == 'No')){
+ 
+ echo "There must be some issue in staging build. Build cannot continue.."
+ // error "User select No.. there must be issues in staging build. Pipeline aborted"
+ 
+ }
+ else {
+     echo "Build continue and will create TAG..."
+
+  
+//cleanWs()
+//checkout([$class: 'GitSCM', branches: [[name: '*/$GIT_BRANCH']], doGenerateSubmoduleConfigurations: false, extensions: [], submoduleCfg: [], userRemoteConfigs: [[credentialsId: 'devops.build', url: '$GIT_URL']]])
+
+withCredentials([usernamePassword(credentialsId: 'devops.msa', passwordVariable: 'PASSWORD', usernameVariable: 'USERNAME')]) {
+    // some block
+sh ('git config --global user.email "devops@evampsaanga.com"')
+sh ('git config --global user.name "JENKINS CI"')
+  
+sh ('git tag -a stg-tag-v-${BUILD_NUMBER} -m "jenkins automate tag"')
+sleep 10
+//sh ("git push https://devops.build@pms.evampsaanga.com:9000/scm/git/testops --tags") //Jazz8080MSA
+sh('git push https://${USERNAME}:${PASSWORD}@repo.evampsaanga.com:5000/jazzmsa/${GIT_DIR_NAME} --tags')
+
+}
+
+//else
+}
+         
+}
+
+//--
+
+}
+//############################################################### End STAGING ###############################################################
+
+
+//############################################################### PRODUCTION ###############################################################
+
+if (( env.ENVIRONMENT == 'PRODUCTION' )){
+
+env.MEMORY_LIMIT="2Gi"
+env.CPU_LIMIT="3000m"
+//env.MEMORY_RESOURCE="1Gi"
+//env.CPU_RESOURCE="1000m"
+env.SPRING_PROFILE="prd"
+env.KUBECONFIG="$WORKSPACE/kubernetes/kubeconfig/production"
+env.NAMESPACE="prod"
+
+echo "Production env"
+tags = sh(script: "git tag -l | sort -V | tail -10 ", returnStdout: true).trim()
+
+stage('CHOICE TAG') {
+
+def tag_response = input message: 'Select production TAG to build it...',
+parameters: [choice(choices: "${tags}",  description: '', name: 'TAG')]
+env.tag_response = tag_response
+
+echo "Checkout TAG: '${tag_response}'"
+
+
+withCredentials([usernamePassword(credentialsId: 'gitrepo', passwordVariable: 'PASSWORD', usernameVariable: 'USERNAME')]) {
+    // some block
+sh ('git checkout ${tag_response}')
+
+}
+
+withCredentials([usernamePassword(credentialsId: 'devops.msa', passwordVariable: 'PASSWORD', usernameVariable: 'USERNAME')]) {
+    // some block
+
+sh 'cd $WORKSPACE'
+sh ('git checkout ${tag_response}')
+
+//sh ("git push https://devops.build@pms.evampsaanga.com:9000/scm/git/testops --tags") //Jazz8080MSA
+
+}
+
+
+
+sleep 10
+//sh 'mv $WORKSPACE/cps-integration/* $WORKSPACE/'
+}
+
+stage('Compile'){
+def javatool = tool name: 'java8', type: 'jdk'
+  withEnv( ["PATH+JAVATOOL=${javatool}/bin"] ) {
+   def maventool = tool name: 'maven', type: 'maven'
+      withEnv( ["PATH+MAVENTOOL=${maventool}/bin"] ) {
+       sh 'mvn clean install -DskipTests'
+      //sh 'mvn clean install'
+
+}
+}
+
+}
+
+stage('Docker build'){
+
+// This step should not normally be used in your script. Consult the inline help for details.
+withDockerRegistry(credentialsId: 'harbor', url: 'https://registry.local') {
+    // some block
+ //   echo "docker build -t ${IMAGENAME}:${IMAGETAG} ."
+     sh "docker build -t ${IMAGENAME}:${IMAGETAG} ."
+     sh "docker push ${IMAGENAME}:${IMAGETAG}"
+
+    
+}
+
+}
+
+
+stage('Deploy on K8s'){
+sh "cp $JENKINS_HOME/custom/kubeconfig/* $WORKSPACE/kubernetes/kubeconfig/"   
+sh "chmod +x $WORKSPACE/kubernetes/deploy.sh"
+sh "$WORKSPACE/kubernetes/deploy.sh"
+
+// sh "ansible-playbook $WORKSPACE/ansible/deploy.yaml  --extra-vars  IMAGENAME=${IMAGENAME} --extra-vars imageTag=${imageTag} -i $WORKSPACE/ansible/inventory.ini"
+
+}
+
+
+stage('Sanity Testcases'){
+    
+ dir("${WORKSPACE}/QA") {
+    
+         
+			sh '$JENKINS_HOME/tools/jmeter/bin/jmeter -n -t Balance_Share.jmx -l report.jtl'
+
+
+       }
+
+}
+
+stage('Publish-test-report'){
+    
+    dir("${WORKSPACE}/QA") {
+    perfReport filterRegex: '', modeOfThreshold: true,relativeFailedThresholdNegative: 1.2, relativeFailedThresholdPositive: 1.89, relativeUnstableThresholdNegative: 1.8, relativeUnstableThresholdPositive: 1.5, showTrendGraphs: true, sourceDataFiles: 'report.jtl'
+    
+    }
+
+}
+
+
+
+}
+//############################################################### PRODUCTION END ###############################################################
+
+//############################################################### DR ###############################################################
+
+if (( env.ENVIRONMENT == 'DR' )){
+
+env.MEMORY_LIMIT="2Gi"
+env.CPU_LIMIT="3000m"
+//env.MEMORY_RESOURCE="1Gi"
+//env.CPU_RESOURCE="1000m"
+env.SPRING_PROFILE="stg"
+env.KUBECONFIG="$WORKSPACE/kubernetes/kubeconfig/dr"
+env.NAMESPACE="prod"
+
+echo "DR env"
+tags = sh(script: "git tag -l | sort -V | tail -10 ", returnStdout: true).trim()
+
+// stage('CHOICE TAG') {
+
+// def tag_response = input message: 'Select production TAG to build it...',
+// parameters: [choice(choices: "${tags}",  description: '', name: 'TAG')]
+// env.tag_response = tag_response
+
+// echo "Checkout TAG: '${tag_response}'"
+
+
+// withCredentials([usernamePassword(credentialsId: 'gitrepo', passwordVariable: 'PASSWORD', usernameVariable: 'USERNAME')]) {
+    
+// sh ('git checkout ${tag_response}')
+
+// }
+
+// withCredentials([usernamePassword(credentialsId: 'devops.msa', passwordVariable: 'PASSWORD', usernameVariable: 'USERNAME')]) {
+    
+
+// sh 'cd $WORKSPACE'
+// sh ('git checkout ${tag_response}')
+
+
+// }
+
+
+
+// sleep 10
+
+// }
+
+stage('Compile'){
+def javatool = tool name: 'java8', type: 'jdk'
+  withEnv( ["PATH+JAVATOOL=${javatool}/bin"] ) {
+   def maventool = tool name: 'maven', type: 'maven'
+      withEnv( ["PATH+MAVENTOOL=${maventool}/bin"] ) {
+       sh 'mvn clean install -DskipTests'
+      //sh 'mvn clean install'
+
+}
+}
+
+}
+
+stage('Docker build'){
+
+// This step should not normally be used in your script. Consult the inline help for details.
+withDockerRegistry(credentialsId: 'harbor', url: 'https://registry.local') {
+    // some block
+ //   echo "docker build -t ${IMAGENAME}:${IMAGETAG} ."
+     sh "docker build -t ${IMAGENAME}:${IMAGETAG} ."
+     sh "docker push ${IMAGENAME}:${IMAGETAG}"
+
+    
+}
+
+}
+
+
+stage('Deploy on K8s'){
+sh "cp $JENKINS_HOME/custom/kubeconfig/dr $WORKSPACE/kubernetes/kubeconfig/"   
+sh "chmod +x $WORKSPACE/kubernetes/deploy.sh"
+sh "$WORKSPACE/kubernetes/deploy.sh"
+
+// sh "ansible-playbook $WORKSPACE/ansible/deploy.yaml  --extra-vars  IMAGENAME=${IMAGENAME} --extra-vars imageTag=${imageTag} -i $WORKSPACE/ansible/inventory.ini"
+
+}
+
+
+stage('Sanity Testcases'){
+    
+ dir("${WORKSPACE}/QA") {
+    
+         
+			sh '$JENKINS_HOME/tools/jmeter/bin/jmeter -n -t Balance_Share.jmx -l report.jtl'
+
+
+       }
+
+}
+
+stage('Publish-test-report'){
+    
+    dir("${WORKSPACE}/QA") {
+    perfReport filterRegex: '', modeOfThreshold: true,relativeFailedThresholdNegative: 1.2, relativeFailedThresholdPositive: 1.89, relativeUnstableThresholdNegative: 1.8, relativeUnstableThresholdPositive: 1.5, showTrendGraphs: true, sourceDataFiles: 'report.jtl'
+    
+    }
+
+}
+
+
+
+}
+//############################################################### DR END ###############################################################
+
+
+}
+
